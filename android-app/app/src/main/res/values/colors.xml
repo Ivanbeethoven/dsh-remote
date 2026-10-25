@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- 启动图标底色：深海军蓝 -->
+    <color name="brand_navy">#12203A</color>
+    <color name="brand_band">#1B2F52</color>
+    <!-- 前景：终端提示符 -->
+    <color name="brand_accent">#38BDF8</color>
+    <color name="brand_ink">#E2E8F0</color>
+</resources>

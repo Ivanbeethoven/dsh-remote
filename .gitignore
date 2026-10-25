@@ -1,0 +1,19 @@
+# 构建产物与本地凭据不得入库
+node_modules/
+
+# Android 产物（APK 里内联了访问密钥，绝不能提交）
+*.apk
+*.aab
+*.idsig
+*.keystore
+*.jks
+
+# 本地/临时
+*.tgz
+*.log
+.local
+local.properties
+.dsh-test/
+.tmpcfg/
+.tmprelay/
+.validate/

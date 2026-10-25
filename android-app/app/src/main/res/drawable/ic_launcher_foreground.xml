@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Adaptive-icon foreground: a terminal prompt (chevron + cursor) on the 108dp canvas.
+  Everything stays inside the 66dp safe zone (x/y 21..87) so no launcher mask clips it.
+-->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+
+    <path
+        android:fillColor="#00000000"
+        android:strokeColor="@color/brand_accent"
+        android:strokeLineCap="round"
+        android:strokeLineJoin="round"
+        android:strokeWidth="6"
+        android:pathData="M31,36 L54,54 L31,72" />
+
+    <path
+        android:fillColor="#00000000"
+        android:strokeColor="@color/brand_ink"
+        android:strokeLineCap="round"
+        android:strokeWidth="6"
+        android:pathData="M60,72 L78,72" />
+</vector>

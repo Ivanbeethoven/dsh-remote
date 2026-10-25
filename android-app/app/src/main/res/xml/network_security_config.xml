@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  The relay serves a self-signed certificate. `onReceivedSslError` can wave a navigation
+  through, but it is never consulted for the WebSocket the DSH client opens — that handshake
+  does its own TLS inside the renderer. So instead of bypassing verification, trust the
+  relay's certificate as an extra anchor on top of the system store: then every request,
+  WS included, verifies normally.
+
+  When the relay certificate is regenerated, replace res/raw/relay_cert.pem AND the
+  RELAY_CERT_SHA256 build field, or the app will (correctly) refuse to connect.
+
+  NOTE: the relay_cert.pem committed to this repository is a sample certificate for
+  localhost so the project builds as-is. Replace it with your own relay's certificate.
+-->
+<network-security-config>
+    <base-config cleartextTrafficPermitted="false">
+        <trust-anchors>
+            <certificates src="system" />
+            <certificates src="@raw/relay_cert" />
+        </trust-anchors>
+    </base-config>
+</network-security-config>

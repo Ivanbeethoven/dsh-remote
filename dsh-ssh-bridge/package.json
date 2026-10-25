@@ -1,0 +1,76 @@
+{
+  "name": "dsh-ssh-bridge",
+  "version": "0.1.0",
+  "private": false,
+  "description": "DeepSeek Harness plugin: control this DSH from a phone with no inbound port — over an SSH server's remote forward, or over a self-hosted TLS relay that needs only a browser.",
+  "type": "module",
+  "main": "./lib/index.mjs",
+  "types": "./lib/index.d.mts",
+  "bin": {
+    "dsh-relay": "./bin/dsh-relay.mjs"
+  },
+  "exports": {
+    ".": {
+      "types": "./lib/index.d.mts",
+      "default": "./lib/index.mjs"
+    },
+    "./relay": {
+      "default": "./lib/relay-server.mjs"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib/**/*.mjs",
+    "lib/**/*.d.mts",
+    "bin/**/*.mjs",
+    "cordis.patch.yml",
+    "README.md",
+    "LICENSE"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "engines": {
+    "node": "^22.19.0 || >=24.0.0"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "~4.0.5"
+  },
+  "peerDependenciesMeta": {
+    "@deepseek-ai/cordis": {
+      "optional": true
+    }
+  },
+  "dependencies": {
+    "@deepseek-ai/schemastery": "^3.18.1",
+    "selfsigned": "^2.4.1",
+    "ssh2": "^1.17.0"
+  },
+  "optionalDependencies": {
+    "qrcode": "^1.5.4"
+  },
+  "scripts": {
+    "test": "node --test --test-timeout=30000",
+    "probe": "node scripts/probe.mjs",
+    "relay": "node bin/dsh-relay.mjs"
+  },
+  "keywords": [
+    "deepseek-harness",
+    "dsh",
+    "dsh-plugin",
+    "plugin",
+    "ssh",
+    "relay",
+    "remote-access",
+    "mobile",
+    "reverse-tunnel"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/your-name/dsh-ssh-bridge.git"
+  },
+  "homepage": "https://github.com/your-name/dsh-ssh-bridge#readme"
+}
