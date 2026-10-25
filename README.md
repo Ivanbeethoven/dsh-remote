@@ -87,7 +87,23 @@ node bin/dsh-relay.mjs --port 8443 --host <你的公网地址> --pool 64
 
 ## 作为 DSH skill 安装
 
-`skills/` 下每个目录是一个 skill。加进 `skill-filesystem` 的搜索路径即可：
+`skills/` 下每个目录是一个 skill（`<name>/SKILL.md`）。
+
+**最简单的办法：链进用户 skill 根目录。** DSH 默认扫描 `~/.dsh/skills`，而且会监听它——
+放进去下一个会话就能看到，不用改任何 profile 配置：
+
+```powershell
+.\tools\install-skills.ps1          # Windows：建 junction
+```
+
+```bash
+ln -s "$PWD/skills/dsh-remote"         ~/.dsh/skills/dsh-remote
+ln -s "$PWD/skills/multi-agent-fleet"  ~/.dsh/skills/multi-agent-fleet
+```
+
+用 junction/软链的好处是：仓库里改了 skill，DSH 直接看到新内容。
+
+**另一种办法：写进 `customSkillDirs`。**
 
 ```yaml
 - id: skill-filesystem
@@ -96,7 +112,10 @@ node bin/dsh-relay.mjs --port 8443 --host <你的公网地址> --pool 64
       - /path/to/dsh-remote/skills
 ```
 
-重启 DSH 后，`dsh-remote` 和 `multi-agent-fleet` 会出现在 skill 目录里，之后：
+注意这会**整体替换**该行的 `customSkillDirs`，自带 skill 目录可能因此不再被扫描；
+除非你确定要接管，否则优先用上面那种。
+
+装好之后：
 
 - 「帮我把手机访问配好」→ agent 按 `dsh-remote` 走
 - 「这几台服务器上的 agent 你来调度」→ agent 按 `multi-agent-fleet` 走
