@@ -17,3 +17,6 @@ local.properties
 .tmpcfg/
 .tmprelay/
 .validate/
+
+# 本机构建备忘（含真实凭据）
+android-app/BUILD-LOCAL.md
