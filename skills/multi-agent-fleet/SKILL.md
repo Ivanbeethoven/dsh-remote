@@ -122,6 +122,41 @@ and exits non-zero on failure — enough to build a dispatch loop without a TUI.
 For a task that must survive the SSH connection, wrap in `tmux new-session -d` or `nohup`,
 and return the session name so the next sweep can find it.
 
+### Mixed Windows + WSL targets
+
+A Windows box whose work happens inside WSL needs two hops, and the script has to be reachable
+from both sides. Copy it to the Windows side, then call it through the WSL mount:
+
+```bash
+scp panes.sh win-a:C:/Users/<user>/panes.sh
+ssh win-a 'wsl -d Ubuntu-22.04 -e bash /mnt/c/Users/<user>/panes.sh 8'
+```
+
+Keep those scripts ASCII with LF endings — CRLF breaks `bash` on the first line, and a BOM
+breaks it in a way that looks like a missing interpreter.
+
+### When the target cannot reach GitHub
+
+Do not copy credentials around. Open a SOCKS tunnel from a host that can, and point the target
+at it:
+
+```bash
+ssh -f -N -D 127.0.0.1:1080 <jump-host>
+export HTTPS_PROXY=socks5://127.0.0.1:1080
+```
+
+Then remember the inverse: a proxy exported WSL-wide will break `git`/`gh` for the commands
+that already had direct access — those need `env -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY`.
+
+### Launching a reviewer on Windows
+
+A reviewer agent started as a child of the coordinator will keep the console attached and can
+steal focus mid-run. Start it detached and poll its log instead:
+
+```powershell
+Start-Process -FilePath cmd.exe -ArgumentList '/c','C:\work\run-review.cmd' -WindowStyle Hidden -PassThru
+```
+
 ## 6. Resource guardrails (these prevent outages, not slow-downs)
 
 Set them **inside the dispatch script and inside the task text**, because an agent that
