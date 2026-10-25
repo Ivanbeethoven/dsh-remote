@@ -20,3 +20,8 @@ local.properties
 
 # 本机构建备忘（含真实凭据）
 android-app/BUILD-LOCAL.md
+
+# 会话分析中间产物（可能含内网地址、命令原文）
+tools/out-*
+tools/session-report.md
+

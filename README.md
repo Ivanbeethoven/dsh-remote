@@ -11,8 +11,21 @@ DSH 侧永远不开入站端口，不做 NAT 穿透、不打洞——两端都�
 |---|---|
 | [`dsh-ssh-bridge/`](dsh-ssh-bridge/) | DSH 插件 + 中继服务端。两种传输：`relay`（HTTPS 单端口）和 `ssh`（remote forward） |
 | [`android-app/`](android-app/) | Android WebView 壳。只内置中继地址和访问密钥，token 每次启动现取 |
-| [`skills/dsh-remote/`](skills/dsh-remote/SKILL.md) | DSH skill：让别的 DSH 用户能一句话让 agent 帮忙装好 |
+| [`skills/`](skills/) | 两个给 agent 用的 skill：`dsh-remote` 装手机访问，`multi-agent-fleet` 管多机多 agent |
 | [`tools/`](tools/) | 验证脚本：走一遍真实重定向链路、抓浏览器控制台、渲染图标预览 |
+
+## 两个 skill
+
+都是写给 **agent** 看的操作指南，不是给人读的教程。装一次，之后一句话就能让 agent 按流程干活。
+
+| skill | 什么时候用 |
+|---|---|
+| [`dsh-remote`](skills/dsh-remote/SKILL.md) | 「帮我把手机访问配好」——装插件、起中继、配对、排障 |
+| [`multi-agent-fleet`](skills/multi-agent-fleet/SKILL.md) | 「这几台机器上的 agent 你来管」——多机并行派活、资源护栏、质量门禁、定时巡检 |
+
+`multi-agent-fleet` 提炼自一次约 28 小时的真实作业：一台 DSH 当协调者，把 coding agent 派到
+5 台机器上并行修 39 个 issue，期间踩过的坑（全局 `pgrep` 卡死 18 小时、默认 codegen units 导致
+OOM、`tmux kill-session` 不杀子进程、PR 开到了 fork 上）都写在里面了。
 
 ## 三种用法
 
@@ -74,7 +87,7 @@ node bin/dsh-relay.mjs --port 8443 --host <你的公网地址> --pool 64
 
 ## 作为 DSH skill 安装
 
-`skills/dsh-remote/SKILL.md` 是给 agent 看的安装指南。把 `skills/` 目录加进 `skill-filesystem`：
+`skills/` 下每个目录是一个 skill。加进 `skill-filesystem` 的搜索路径即可：
 
 ```yaml
 - id: skill-filesystem
@@ -83,7 +96,12 @@ node bin/dsh-relay.mjs --port 8443 --host <你的公网地址> --pool 64
       - /path/to/dsh-remote/skills
 ```
 
-之后别的 DSH 用户只要说「帮我把手机访问配好」，agent 就会按这份流程走。
+重启 DSH 后，`dsh-remote` 和 `multi-agent-fleet` 会出现在 skill 目录里，之后：
+
+- 「帮我把手机访问配好」→ agent 按 `dsh-remote` 走
+- 「这几台服务器上的 agent 你来调度」→ agent 按 `multi-agent-fleet` 走
+
+skill 只在被加载时才占上下文，平时只是一个名字和一句话描述。
 
 ## 需要注意
 
