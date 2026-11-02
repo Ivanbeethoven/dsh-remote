@@ -112,7 +112,7 @@ test('the plugin publishes the DSH listener through the relay for a browser', as
     accessToken: ACCESS_TOKEN,
     certFile: path.join(dir, 'cert.pem'),
     keyFile: path.join(dir, 'key.pem'),
-    hosts: ['127.0.0.1'],
+    certHosts: ['127.0.0.1'],
   });
 
   const ctx = makeContext({

@@ -1,11 +1,12 @@
 /**
- * A minimal browser stand-in for relay tests: raw TLS, one HTTP/1.1 request,
- * connection close. Deliberately dumb so the test asserts on bytes, not on a client
- * library's behaviour.
+ * A minimal browser stand-in for relay tests: one HTTP/1.1 request over TLS (or a plain
+ * socket), connection close. Deliberately dumb so the test asserts on bytes, not on a
+ * client library's behaviour.
  *
  * @module tests/helpers/relay-phone
  */
 
+import net from 'node:net';
 import tls from 'node:tls';
 
 /**
@@ -59,13 +60,16 @@ function parseResponse(buffer) {
  * @param {string} [options.method] - HTTP method.
  * @returns {Promise<{ status: number, headers: Record<string, string>, body: string }>}
  */
-export function request({ port, path = '/', cookie, method = 'GET' }) {
+export function request({ port, path = '/', cookie, method = 'GET', secure = true }) {
   return new Promise((resolve, reject) => {
-    const socket = tls.connect({ host: '127.0.0.1', port, rejectUnauthorized: false }, () => {
+    const onConnect = () => {
       const lines = [`${method} ${path} HTTP/1.1`, 'host: 127.0.0.1', 'connection: close'];
       if (cookie !== undefined) lines.push(`cookie: ${cookie}`);
       socket.write(`${lines.join('\r\n')}\r\n\r\n`);
-    });
+    };
+    const socket = secure
+      ? tls.connect({ host: '127.0.0.1', port, rejectUnauthorized: false }, onConnect)
+      : net.connect({ host: '127.0.0.1', port }, onConnect);
 
     let buffer = Buffer.alloc(0);
     socket.setTimeout(10_000, () => {
@@ -91,11 +95,12 @@ export function request({ port, path = '/', cookie, method = 'GET' }) {
  * @param {number} options.port - Relay port.
  * @param {string} options.accessToken - Relay access key.
  * @param {string} [options.extraQuery] - Extra query string without the leading `&`.
+ * @param {boolean} [options.secure] - Use TLS; `false` for a plain relay.
  * @returns {Promise<{ cookie: string, location: string, status: number }>}
  */
-export async function pair({ port, accessToken, extraQuery }) {
+export async function pair({ port, accessToken, extraQuery, secure = true }) {
   const query = extraQuery === undefined ? `rk=${encodeURIComponent(accessToken)}` : `rk=${encodeURIComponent(accessToken)}&${extraQuery}`;
-  const first = await request({ port, path: `/?${query}` });
+  const first = await request({ port, path: `/?${query}`, secure });
   const setCookie = first.headers['set-cookie'];
   if (setCookie === undefined) throw new Error(`pairing did not set a cookie (status ${first.status})`);
   return { cookie: setCookie.split(';')[0], location: first.headers.location ?? '', status: first.status };

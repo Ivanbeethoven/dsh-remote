@@ -57,7 +57,7 @@ async function startRelayAndClient({ poolSize = 2 } = {}) {
     accessToken: ACCESS_TOKEN,
     certFile,
     keyFile,
-    hosts: ['127.0.0.1'],
+    certHosts: ['127.0.0.1'],
     poolSize: 8,
     /* Short enough that the "no free connection" path is testable, long enough that a
        refill can rescue a queued request. */
@@ -185,8 +185,9 @@ test('the health endpoint reports the pool without authentication', async (t) =>
   assert.equal(health.status, 200);
   const body = JSON.parse(health.body);
   assert.equal(body.ok, true);
-  assert.equal(body.host, 'default');
-  assert.ok(body.idle > 0);
+  assert.equal(body.hosts.length, 1, 'one host is configured');
+  assert.equal(body.hosts[0].hostId, 'default');
+  assert.ok(body.hosts[0].idle > 0);
 });
 
 test('a browser is told DSH is away when the pool stays empty', async (t) => {
@@ -198,7 +199,7 @@ test('a browser is told DSH is away when the pool stays empty', async (t) => {
   const pairing = await pair({ port: rig.relay.port, accessToken: ACCESS_TOKEN });
 
   rig.client.stop();
-  await waitFor(() => rig.relay.status().idle === 0, { timeoutMs: 10_000 });
+  await waitFor(() => rig.relay.status().hosts[0].idle === 0, { timeoutMs: 10_000 });
 
   const away = await request({ port: rig.relay.port, cookie: pairing.cookie });
   assert.equal(away.status, 503);
@@ -216,7 +217,7 @@ test('a queued browser is served as soon as a connection frees up', async (t) =>
   /* Drain the pool, then issue a request: with no idle connection it has to wait rather
      than fail, because a browser opens several connections at once for one page. */
   rig.client.stop();
-  await waitFor(() => rig.relay.status().idle === 0, { timeoutMs: 10_000 });
+  await waitFor(() => rig.relay.status().hosts[0].idle === 0, { timeoutMs: 10_000 });
 
   const pending = request({ port: rig.relay.port, path: '/queued', cookie: pairing.cookie });
   await new Promise((resolve) => setTimeout(resolve, 120));
@@ -237,7 +238,7 @@ test('a wrong host token never joins the pool', async (t) => {
     accessToken: ACCESS_TOKEN,
     certFile,
     keyFile,
-    hosts: ['127.0.0.1'],
+    certHosts: ['127.0.0.1'],
   });
 
   const client = new RelayClient({
@@ -269,7 +270,7 @@ test('a wrong host token never joins the pool', async (t) => {
 
   client.start();
   await waitFor(() => (client.status().lastError ?? '').includes('unauthorized'), { timeoutMs: 10_000 });
-  assert.equal(relay.status().idle, 0);
+  assert.equal(relay.status().hosts[0].idle, 0);
 });
 
 test('a pinned certificate fingerprint rejects an impostor relay', async (t) => {
@@ -282,7 +283,7 @@ test('a pinned certificate fingerprint rejects an impostor relay', async (t) => 
     accessToken: ACCESS_TOKEN,
     certFile: first.certFile,
     keyFile: first.keyFile,
-    hosts: ['127.0.0.1'],
+    certHosts: ['127.0.0.1'],
   });
 
   const client = new RelayClient({
@@ -315,5 +316,5 @@ test('a pinned certificate fingerprint rejects an impostor relay', async (t) => 
 
   client.start();
   await waitFor(() => (client.status().lastError ?? '').includes('fingerprint mismatch'), { timeoutMs: 10_000 });
-  assert.equal(relay.status().idle, 0);
+  assert.equal(relay.status().hosts[0].idle, 0);
 });

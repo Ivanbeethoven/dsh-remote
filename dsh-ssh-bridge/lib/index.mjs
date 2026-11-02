@@ -79,6 +79,8 @@ export const Config = Schema.object({
       .description('Relay hostname or IP. Empty falls back to ssh.host.'),
     port: Schema.natural().min(1).max(65535).default(8443)
       .description('Relay port.'),
+    protocol: Schema.union(['https', 'http'].map((kind) => Schema.const(kind))).default('https')
+      .description('https verifies the relay certificate. http speaks plain text: the access key and the DSH launch token then cross the network in the clear, so only pick it on a link you trust.'),
     publicHost: Schema.string().default('')
       .description('Address the phone uses in the pairing link, when it differs from relay.host (for example behind NAT).'),
     publicPort: Schema.natural().min(0).max(65535).default(0)
@@ -172,6 +174,7 @@ export function resolveConfig(config = {}) {
     relay: {
       host: relayHost,
       port: relayPort,
+      protocol: relay.protocol === 'http' ? 'http' : 'https',
       publicHost: (relay.publicHost ?? '').trim(),
       publicPort: relay.publicPort === undefined || relay.publicPort === 0 ? relayPort : relay.publicPort,
       token: relay.token ?? '',

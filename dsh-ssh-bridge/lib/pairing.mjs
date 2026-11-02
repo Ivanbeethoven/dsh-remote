@@ -82,7 +82,9 @@ export async function buildPairing({ ssh, forward, phonePort, authenticatedUrl, 
 export async function buildRelayPairing({ relay, authenticatedUrl, qr = true }) {
   const host = relay.publicHost === '' ? relay.host : relay.publicHost;
   const authority = host.includes(':') && !host.startsWith('[') ? `[${host}]` : host;
-  const url = `https://${authority}:${relay.publicPort}${CLEAN_PATH}`;
+  /* Plain HTTP is opt-in; the link scheme must match what the relay actually serves. */
+  const scheme = relay.protocol === 'http' ? 'http' : 'https';
+  const url = `${scheme}://${authority}:${relay.publicPort}${CLEAN_PATH}`;
 
   /* The relay trades ?rk= for its own cookie and redirects to the remaining query, so
      the access key and DSH's launch token can travel in one link. */

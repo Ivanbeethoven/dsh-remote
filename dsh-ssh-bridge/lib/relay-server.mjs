@@ -1,20 +1,25 @@
 /**
- * The relay: one public TLS port that multiplexes a DSH host and phone browsers.
+ * The relay: one public port that serves one *or several* DSH hosts to browsers.
  *
- * Responsibilities, in order:
- * 1. terminate TLS;
- * 2. tell a DSH host connection (opened by the plugin) from a browser connection;
- * 3. hold authenticated host connections in an idle pool;
- * 4. gate browsers behind an access token, then hand each one a pooled host
- *    connection and become a raw byte pipe.
+ * Two independent axes:
  *
- * Because the last step is a blind pipe, the relay never parses HTTP bodies,
- * WebSocket frames, or DSH's own protocol — it only inspects the first request head
- * to authenticate and route.
+ * - Transport: TLS by default, or plain HTTP when the operator asks for it. Plain mode exists
+ *   because a self-signed certificate costs every new browser a warning; it also puts the
+ *   access key and the DSH launch token on the wire in clear text, so it is the operator's
+ *   call, never an automatic fallback.
+ * - Tenancy: every host registers with its own `hostId`, `hostToken`, and `accessToken`. A
+ *   browser selects a host by the access key it presents — in the URL while pairing, in the
+ *   `dsh_relay` cookie afterwards. That is why one port carries several machines without
+ *   rewriting paths: the credential *is* the routing key.
+ *
+ * Per connection the relay still does one thing: it gate-checks the first request head, then
+ * becomes a blind byte pipe, so HTTP keep-alive, chunked bodies, and WebSocket upgrades pass
+ * through untouched.
  *
  * @module dsh-ssh-bridge/relay-server
  */
 
+import net from 'node:net';
 import tls from 'node:tls';
 
 import { ensureCertificate } from './relay-cert.mjs';
@@ -33,7 +38,7 @@ const MAX_HEAD_BYTES = 32 * 1024;
 /** Largest host handshake line accepted. */
 const MAX_HANDSHAKE_BYTES = 4 * 1024;
 
-/** Browser cookie that carries the relay access token. */
+/** Browser cookie that carries a host's access token. */
 const ACCESS_COOKIE = 'dsh_relay';
 
 /** Terminator of an HTTP request head. */
@@ -41,8 +46,7 @@ const HEAD_TERMINATOR = Buffer.from('\r\n\r\n');
 
 /**
  * Read from a socket until a terminator appears.
- *
- * @param {import('node:tls').TLSSocket} socket - Connection to read.
+ * @param {import('node:net').Socket} socket - Connection to read.
  * @param {Buffer} initial - Bytes already read.
  * @param {Buffer} terminator - Byte sequence to stop at.
  * @param {number} limit - Maximum bytes buffered before giving up.
@@ -83,8 +87,23 @@ function readUntil(socket, initial, terminator, limit, onDone, onOverflow) {
 }
 
 /**
+ * Reason phrase for a status code this relay emits.
+ * @param {number} status - Status code.
+ * @returns {string} Reason phrase.
+ */
+function statusName(status) {
+  switch (status) {
+    case 200: return 'OK';
+    case 303: return 'See Other';
+    case 403: return 'Forbidden';
+    case 503: return 'Service Unavailable';
+    default: return 'Error';
+  }
+}
+
+/**
  * Write a complete HTTP response and close the socket.
- * @param {import('node:tls').TLSSocket} socket - Connection to answer.
+ * @param {import('node:net').Socket} socket - Connection to answer.
  * @param {number} status - HTTP status code.
  * @param {string} body - Response body.
  * @param {Record<string, string | string[]>} [headers] - Extra headers.
@@ -107,21 +126,6 @@ function respond(socket, status, body, headers = {}) {
 }
 
 /**
- * Reason phrase for a status code this relay emits.
- * @param {number} status - Status code.
- * @returns {string} Reason phrase.
- */
-function statusName(status) {
-  switch (status) {
-    case 200: return 'OK';
-    case 303: return 'See Other';
-    case 403: return 'Forbidden';
-    case 503: return 'Service Unavailable';
-    default: return 'Error';
-  }
-}
-
-/**
  * Minimal HTML escape.
  * @param {unknown} value - Value to escape.
  * @returns {string} Escaped text.
@@ -135,7 +139,7 @@ function escape(value) {
 }
 
 /**
- * Render the relay's own login page, shown when the browser has no access cookie.
+ * Render the relay's own login page, shown when a browser presents no usable credential.
  * @param {string} [message] - Optional explanation.
  * @returns {string} HTML document.
  */
@@ -167,69 +171,133 @@ function renderLogin(message) {
 }
 
 /**
+ * Normalise the accepted host shapes into one list.
+ * @param {object} options - createRelay options.
+ * @returns {{ hostId: string, hostToken: string, accessToken: string }[]} Hosts to serve.
+ */
+function normalizeHosts({ hosts, hostId = 'default', hostToken, accessToken }) {
+  const source = Array.isArray(hosts) && hosts.length > 0
+    ? hosts
+    : [{ hostId, hostToken, accessToken }];
+  return source.map((host, index) => ({
+    hostId: typeof host.hostId === 'string' && host.hostId !== '' ? host.hostId : `host-${index + 1}`,
+    hostToken: host.hostToken,
+    accessToken: host.accessToken,
+  }));
+}
+
+/**
  * Start the relay.
  *
  * @param {object} options - Relay options.
  * @param {number} [options.port] - Public port, default 8443.
  * @param {string} [options.bind] - Bind address, default `0.0.0.0`.
- * @param {string} options.hostToken - Secret the DSH host must present.
- * @param {string} options.accessToken - Secret a browser must present once.
- * @param {string} [options.hostId] - Expected host identifier.
- * @param {string} [options.certFile] - PEM certificate, generated when unset.
- * @param {string} [options.keyFile] - PEM key, generated when unset.
- * @param {string[]} [options.hosts] - Addresses the generated certificate must cover.
- * @param {number} [options.poolSize] - Idle host connections held, default 16.
+ * @param {boolean} [options.secure] - Serve TLS. Default `true`; `false` serves plain HTTP.
+ * @param {{ hostId: string, hostToken: string, accessToken: string }[]} [options.hosts] - Several hosts on one port.
+ * @param {string} [options.hostToken] - Single-host shorthand.
+ * @param {string} [options.accessToken] - Single-host shorthand.
+ * @param {string} [options.hostId] - Single-host shorthand, default `default`.
+ * @param {string} [options.certFile] - PEM certificate, generated when unset (TLS only).
+ * @param {string} [options.keyFile] - PEM key, generated when unset (TLS only).
+ * @param {string[]} [options.certHosts] - Addresses the generated certificate must cover.
+ * @param {number} [options.poolSize] - Idle host connections held per host, default 16.
+ * @param {number} [options.waitMs] - How long a browser waits for a free connection, default 6000.
  * @param {(level: string, message: string) => void} [options.log] - Log sink.
  * @returns {Promise<object>} Running relay handle.
  */
 export async function createRelay({
   port = 8443,
   bind = '0.0.0.0',
+  secure = true,
+  hosts = [],
   hostToken,
   accessToken,
   hostId = 'default',
   certFile,
   keyFile,
-  hosts = [],
+  certHosts = [],
   poolSize = 16,
   waitMs = 6000,
   log = () => {},
 } = {}) {
-  if (typeof hostToken !== 'string' || hostToken.length < 16) {
-    throw new Error('relay: hostToken must be at least 16 characters');
-  }
-  if (typeof accessToken !== 'string' || accessToken.length < 12) {
-    throw new Error('relay: accessToken must be at least 12 characters');
+  const configured = normalizeHosts({ hosts, hostId, hostToken, accessToken });
+  if (configured.length === 0) throw new Error('relay: no hosts configured');
+
+  for (const host of configured) {
+    if (typeof host.hostToken !== 'string' || host.hostToken.length < 16) {
+      throw new Error(`relay: host ${host.hostId} needs a hostToken of at least 16 characters`);
+    }
+    if (typeof host.accessToken !== 'string' || host.accessToken.length < 12) {
+      throw new Error(`relay: host ${host.hostId} needs an accessToken of at least 12 characters`);
+    }
   }
 
-  const material = await ensureCertificate({ certFile, keyFile, hosts: [...hosts, bind === '0.0.0.0' ? '' : bind].filter(Boolean) });
+  const seenTokens = new Set();
+  for (const host of configured) {
+    if (seenTokens.has(host.accessToken)) {
+      throw new Error(`relay: two hosts share the same accessToken (${host.hostId})`);
+    }
+    seenTokens.add(host.accessToken);
+  }
 
-  /** @type {{ socket: import('node:tls').TLSSocket, at: number, closed: boolean }[]} */
-  const idle = [];
-  /** @type {{ socket: import('node:tls').TLSSocket, prefix: Buffer, timer: any }[]} */
-  const waiting = [];
-  /** Host connections that have been handed to a browser. */
-  const active = new Set();
-  const stats = { served: 0, refused: 0, rejectedHosts: 0, blockedBrowsers: 0 };
-  let registeredHostId;
-  let closed = false;
+  const material = secure
+    ? await ensureCertificate({
+      certFile,
+      keyFile,
+      hosts: [...certHosts, bind === '0.0.0.0' ? '' : bind].filter(Boolean),
+    })
+    : undefined;
+
+  /** Per-host runtime: idle connections, waiting browsers, counters. */
+  const table = configured.map((host) => ({
+    ...host,
+    idle: [],
+    waiters: [],
+    registered: false,
+    open: 0,
+    served: 0,
+    refused: 0,
+  }));
+
+  const stats = { rejectedHosts: 0, rejectedBrowsers: 0 };
 
   /**
-   * Remove a dead or consumed entry from the idle pool.
+   * Find a host by an access key a browser presented.
+   * @param {string | null | undefined} key - Candidate access token.
+   * @returns {object | undefined} The matching host, when one exists.
+   */
+  const hostByAccessKey = (key) => (key === null || key === undefined
+    ? undefined
+    : table.find((host) => tokenEquals(key, host.accessToken)));
+
+  /**
+   * Find a host by the credentials a host connection presented.
+   * @param {string} claimedHostId - Host identifier from the handshake.
+   * @param {unknown} token - Host token from the handshake.
+   * @returns {object | undefined} The matching host, when one exists.
+   */
+  const hostByHostToken = (claimedHostId, token) => table.find(
+    (host) => host.hostId === claimedHostId && tokenEquals(token, host.hostToken),
+  );
+
+  /**
+   * Drop one idle entry.
+   * @param {object} host - Host record.
    * @param {object} entry - Pool entry.
    */
-  const dropIdle = (entry) => {
-    const index = idle.indexOf(entry);
-    if (index >= 0) idle.splice(index, 1);
+  const dropIdle = (host, entry) => {
+    const index = host.idle.indexOf(entry);
+    if (index >= 0) host.idle.splice(index, 1);
   };
 
   /**
-   * Take a live idle host connection.
+   * Take a live idle connection for one host.
+   * @param {object} host - Host record.
    * @returns {object | undefined} A usable entry.
    */
-  const takeIdle = () => {
-    while (idle.length > 0) {
-      const entry = idle.pop();
+  const takeIdle = (host) => {
+    while (host.idle.length > 0) {
+      const entry = host.idle.pop();
       if (entry.closed || entry.socket.destroyed) continue;
       return entry;
     }
@@ -237,67 +305,87 @@ export async function createRelay({
   };
 
   /**
-   * Bridge any browsers that were waiting for a free host connection.
-   *
-   * A browser opens a handful of connections in parallel for one page — scripts, styles,
-   * the WebSocket — so a small idle pool empties instantly at first paint. Rather than
-   * answer 503 (which aborts those assets and leaves the app unmounted and white), a
-   * request waits briefly for the next host connection to arrive.
+   * Pipe one browser connection to one host connection.
+   * @param {import('node:net').Socket} browser - Browser connection.
+   * @param {Buffer} prefix - Request bytes to replay to the host.
+   * @param {object} host - Host record.
+   * @param {object} entry - Host pool entry.
    */
-  const flushWaiting = () => {
-    while (waiting.length > 0) {
-      const waiter = waiting[0];
-      const entry = takeIdle();
+  const bridge = (browser, prefix, host, entry) => {
+    const upstream = entry.socket;
+    host.open += 1;
+    host.served += 1;
+
+    const close = () => {
+      browser.destroy();
+      upstream.destroy();
+    };
+    browser.on('error', close);
+    upstream.on('error', close);
+    browser.on('close', () => {
+      host.open = Math.max(0, host.open - 1);
+      upstream.destroy();
+    });
+    upstream.on('close', () => browser.destroy());
+
+    if (prefix.length > 0) upstream.write(prefix);
+    upstream.pipe(browser);
+    browser.pipe(upstream);
+    browser.resume();
+  };
+
+  /**
+   * Bridge any browsers of one host that were waiting for a free connection.
+   * @param {object} host - Host record.
+   */
+  const flushWaiting = (host) => {
+    while (host.waiters.length > 0) {
+      const waiter = host.waiters[0];
+      const entry = takeIdle(host);
       if (entry === undefined) return;
-      waiting.shift();
+      host.waiters.shift();
       clearTimeout(waiter.timer);
-      bridge(waiter.socket, waiter.prefix, entry);
+      bridge(waiter.socket, waiter.prefix, host, entry);
     }
   };
 
   /**
-   * Queue one browser connection until a host connection frees up.
-   * @param {import('node:tls').TLSSocket} socket - Browser connection.
-   * @param {Buffer} prefix - Request bytes to replay to the host.
+   * Queue a browser until one of its host's connections frees up.
+   * @param {import('node:net').Socket} socket - Browser connection.
+   * @param {Buffer} prefix - Request bytes to replay.
+   * @param {object} host - Host record.
    */
-  const enqueueWaiting = (socket, prefix) => {
+  const enqueueWaiting = (socket, prefix, host) => {
     const waiter = { socket, prefix, timer: undefined };
     waiter.timer = setTimeout(() => {
-      const index = waiting.indexOf(waiter);
+      const index = host.waiters.indexOf(waiter);
       if (index < 0) return;
-      waiting.splice(index, 1);
-      stats.refused += 1;
+      host.waiters.splice(index, 1);
+      host.refused += 1;
       respond(socket, 503, `<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>DSH relay</title><body style="font:16px/1.6 system-ui;padding:2rem">
 <h1 style="font-size:1.1rem">No free relay connection</h1>
-<p style="opacity:.7">The DSH host did not supply an idle connection in time. It retries
+<p style="opacity:.7">${escape(host.hostId)} did not supply an idle connection in time. It retries
 automatically — reload in a few seconds.</p></body>`);
     }, waitMs);
     waiter.timer.unref?.();
 
     socket.once('close', () => {
-      const index = waiting.indexOf(waiter);
-      if (index >= 0) waiting.splice(index, 1);
+      const index = host.waiters.indexOf(waiter);
+      if (index >= 0) host.waiters.splice(index, 1);
       clearTimeout(waiter.timer);
     });
 
-    waiting.push(waiter);
+    host.waiters.push(waiter);
   };
 
   /**
-   * Register a connection that presented a valid host handshake.
-   * @param {import('node:tls').TLSSocket} socket - Connection.
-   * @param {string} claimedHostId - Host identifier from the handshake.
+   * Add one authenticated connection to a host's idle pool.
+   * @param {import('node:net').Socket} socket - Connection.
+   * @param {object} host - The host this connection belongs to.
    */
-  const registerHost = (socket, claimedHostId) => {
-    if (registeredHostId === undefined) registeredHostId = claimedHostId;
-    if (claimedHostId !== registeredHostId) {
-      stats.rejectedHosts += 1;
-      log('warn', `relay: refused host ${JSON.stringify(claimedHostId)}; this port already serves ${JSON.stringify(registeredHostId)}`);
-      socket.end('ERR host-id-taken\n');
-      return;
-    }
-    if (idle.length >= poolSize) {
+  const registerHost = (socket, host) => {
+    if (host.idle.length >= poolSize) {
       socket.end('ERR pool-full\n');
       return;
     }
@@ -305,46 +393,23 @@ automatically — reload in a few seconds.</p></body>`);
     const entry = { socket, at: Date.now(), closed: false };
     const forget = () => {
       entry.closed = true;
-      dropIdle(entry);
-      active.delete(entry);
+      dropIdle(host, entry);
     };
     socket.on('close', forget);
     socket.on('error', forget);
     socket.setKeepAlive(true, 15_000);
-    idle.push(entry);
+    host.idle.push(entry);
+    if (!host.registered) {
+      host.registered = true;
+      log('info', `relay: host ${JSON.stringify(host.hostId)} registered`);
+    }
     socket.resume();
-    flushWaiting();
+    flushWaiting(host);
   };
 
   /**
-   * Pipe one browser connection to one host connection.
-   * @param {import('node:tls').TLSSocket} browser - Browser connection.
-   * @param {Buffer} leftover - Bytes already read past the request head.
-   * @param {object} entry - Host pool entry.
-   */
-  const bridge = (browser, leftover, entry) => {
-    const host = entry.socket;
-    active.add(entry);
-    stats.served += 1;
-
-    const close = () => {
-      browser.destroy();
-      host.destroy();
-    };
-    browser.on('error', close);
-    host.on('error', close);
-    browser.on('close', () => host.destroy());
-    host.on('close', () => browser.destroy());
-
-    if (leftover.length > 0) host.write(leftover);
-    host.pipe(browser);
-    browser.pipe(host);
-    browser.resume();
-  };
-
-  /**
-   * Answer one browser request: reserved routes first, then the access gate, then the proxy.
-   * @param {import('node:tls').TLSSocket} socket - Browser connection.
+   * Answer one browser request: reserved health route, then per-host gating, then the proxy.
+   * @param {import('node:net').Socket} socket - Browser connection.
    * @param {Buffer} head - Request head.
    * @param {Buffer} leftover - Bytes past the head.
    */
@@ -360,7 +425,7 @@ automatically — reload in a few seconds.</p></body>`);
 
     let url;
     try {
-      url = new URL(target, 'https://relay.invalid');
+      url = new URL(target, 'http://relay.invalid');
     } catch {
       respond(socket, 403, 'bad request');
       return;
@@ -369,69 +434,75 @@ automatically — reload in a few seconds.</p></body>`);
     if (url.pathname === `${RESERVED_PREFIX}health`) {
       respond(socket, 200, `${JSON.stringify({
         ok: true,
-        host: registeredHostId ?? null,
-        idle: idle.length,
-        active: active.size,
-        served: stats.served,
+        secure,
+        hosts: table.map((host) => ({
+          hostId: host.hostId,
+          registered: host.registered,
+          idle: host.idle.length,
+          open: host.open,
+          served: host.served,
+          refused: host.refused,
+        })),
       }, null, 2)}\n`, { 'content-type': 'application/json; charset=utf-8' });
       return;
     }
 
-    /* A valid ?rk=<accessToken> authorises the request on its own — that is what the key is
-       for. Two shapes:
-         - the root path without a cookie is a one-time gate: answer 303, set the cookie,
-           and drop the key from the URL so it stays out of history;
-         - everything else (and any request that already has the cookie) is proxied with the
-           key left intact, because the plugin authenticates /ssh-bridge by reading it. That
-           keeps an installed app to a single hop and means a browser that drops the cookie
-           still gets through instead of being bounced to itself forever. */
+    /* The credential selects the host: `?rk=` while pairing, the cookie afterwards. A cookie
+       always wins, so a stale key from another host cannot redirect an authenticated session. */
     const presented = url.searchParams.get('rk');
-    const authenticated = tokenEquals(readCookie(headers.cookie, ACCESS_COOKIE), accessToken);
-    let authorized = authenticated;
+    const cookieKey = readCookie(headers.cookie, ACCESS_COOKIE);
+    const cookieHost = hostByAccessKey(cookieKey);
+    const presentedHost = hostByAccessKey(presented);
+    const host = cookieHost ?? presentedHost;
 
-    if (presented !== null) {
-      if (!tokenEquals(presented, accessToken)) {
-        stats.blockedBrowsers += 1;
+    if (host === undefined) {
+      if (presented !== null) {
+        stats.rejectedBrowsers += 1;
         respond(socket, 403, renderLogin('That access key was not accepted.'));
         return;
       }
-      authorized = true;
+      respond(socket, 200, renderLogin());
+      return;
+    }
 
-      if (!authenticated && (url.pathname === '' || url.pathname === '/')) {
+    if (cookieHost === undefined) {
+      if (presentedHost === undefined) {
+        respond(socket, 200, renderLogin());
+        return;
+      }
+      /* Gate once on the root path and drop the key from the redirect. Deeper paths are
+         proxied with the key intact, which is what lets an installed app pair in one hop. */
+      if (url.pathname === '' || url.pathname === '/') {
         url.searchParams.delete('rk');
+        const attributes = `Path=/; HttpOnly; SameSite=Lax; Max-Age=31536000${secure ? '; Secure' : ''}`;
         respond(socket, 303, '', {
           location: `${url.pathname === '' ? '/' : url.pathname}${url.search}`,
-          'set-cookie': `${ACCESS_COOKIE}=${accessToken}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=31536000`,
+          'set-cookie': `${ACCESS_COOKIE}=${host.accessToken}; ${attributes}`,
         });
         return;
       }
     }
 
-    if (!authorized) {
-      stats.blockedBrowsers += 1;
-      respond(socket, 200, renderLogin());
-      return;
-    }
-
     const prefix = Buffer.concat([head, HEAD_TERMINATOR, leftover]);
-    const entry = takeIdle();
+    const entry = takeIdle(host);
     if (entry !== undefined) {
-      bridge(socket, prefix, entry);
+      bridge(socket, prefix, host, entry);
       return;
     }
-
-    enqueueWaiting(socket, prefix);
+    enqueueWaiting(socket, prefix, host);
   };
 
   /**
-   * Handle one accepted TLS connection.
-   * @param {import('node:tls').TLSSocket} socket - Connection.
+   * Handle one accepted connection.
+   * @param {import('node:net').Socket} socket - Connection.
    */
   const onConnection = (socket) => {
     socket.setNoDelay(true);
     socket.on('error', () => {});
     const handshakeDeadline = setTimeout(() => socket.destroy(), 20_000);
     handshakeDeadline.unref?.();
+
+    let buffer = Buffer.alloc(0);
 
     const onFirstBytes = (chunk) => {
       buffer = Buffer.concat([buffer, chunk]);
@@ -451,33 +522,39 @@ automatically — reload in a few seconds.</p></body>`);
             socket.end('ERR bad-handshake\n');
             return;
           }
-          if (payload?.v !== HANDSHAKE_VERSION || !tokenEquals(payload?.token, hostToken)) {
+          if (payload?.v !== HANDSHAKE_VERSION) {
+            socket.end('ERR bad-handshake\n');
+            return;
+          }
+          /* Resolve the host before acknowledging: a client must see the refusal as its
+             handshake reply, not as a connection that succeeded and then vanished. */
+          const host = hostByHostToken(
+            typeof payload.hostId === 'string' ? payload.hostId : 'default',
+            payload.token,
+          );
+          if (host === undefined) {
             stats.rejectedHosts += 1;
-            log('warn', 'relay: rejected a host connection with a bad token');
+            log('warn', `relay: rejected host connection for ${JSON.stringify(payload.hostId)} (unknown id or token)`);
             socket.end('ERR unauthorized\n');
             return;
           }
           socket.write('OK\n');
-          registerHost(socket, typeof payload.hostId === 'string' ? payload.hostId : 'default');
-          log('info', `relay: host ${JSON.stringify(registeredHostId)} registered (idle ${idle.length}/${poolSize})`);
+          registerHost(socket, host);
         }, () => socket.destroy());
         return;
       }
 
-      readUntil(socket, buffer, Buffer.from('\r\n\r\n'), MAX_HEAD_BYTES, (head, rest) => {
+      readUntil(socket, buffer, HEAD_TERMINATOR, MAX_HEAD_BYTES, (head, rest) => {
         handleBrowser(socket, head, rest);
       }, () => respond(socket, 403, 'request head too large'));
     };
 
-    let buffer = Buffer.alloc(0);
     socket.on('data', onFirstBytes);
   };
 
-  const server = tls.createServer({
-    cert: material.cert,
-    key: material.key,
-    minVersion: 'TLSv1.2',
-  }, onConnection);
+  const server = secure
+    ? tls.createServer({ cert: material.cert, key: material.key, minVersion: 'TLSv1.2' }, onConnection)
+    : net.createServer(onConnection);
   server.on('tlsClientError', () => {});
 
   await new Promise((resolve, reject) => {
@@ -489,22 +566,32 @@ automatically — reload in a few seconds.</p></body>`);
 
   return {
     server,
+    secure,
     port: typeof address === 'object' && address !== null ? address.port : port,
-    fingerprint: material.fingerprint,
-    generatedCertificate: material.generated,
+    fingerprint: material?.fingerprint,
+    generatedCertificate: material?.generated ?? false,
     status: () => ({
-      host: registeredHostId ?? null,
-      idle: idle.length,
-      active: active.size,
+      secure,
+      hosts: table.map((host) => ({
+        hostId: host.hostId,
+        registered: host.registered,
+        idle: host.idle.length,
+        open: host.open,
+        served: host.served,
+        refused: host.refused,
+      })),
       ...stats,
     }),
     close: async () => {
-      if (closed) return;
-      closed = true;
-      for (const entry of idle) entry.socket.destroy();
-      idle.length = 0;
-      for (const entry of active) entry.socket.destroy();
-      active.clear();
+      for (const host of table) {
+        for (const entry of host.idle) entry.socket.destroy();
+        host.idle.length = 0;
+        for (const waiter of host.waiters) {
+          clearTimeout(waiter.timer);
+          waiter.socket.destroy();
+        }
+        host.waiters.length = 0;
+      }
       await new Promise((resolve) => server.close(resolve));
     },
   };

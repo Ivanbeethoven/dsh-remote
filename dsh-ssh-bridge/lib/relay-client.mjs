@@ -123,12 +123,13 @@ export class RelayClient extends EventEmitter {
 
   /**
    * The browser-facing URL of this relay.
-   * @returns {string} `https://<publicHost>:<publicPort>/`
+   * @returns {string} `<protocol>://<publicHost>:<publicPort>/`
    */
   #publicUrl() {
     const relay = this.#config.relay;
     const host = relay.publicHost === '' ? relay.host : relay.publicHost;
-    return `https://${isIpLiteral(host) && host.includes(':') ? `[${host}]` : host}:${relay.publicPort}/`;
+    const scheme = relay.protocol === 'http' ? 'http' : 'https';
+    return `${scheme}://${isIpLiteral(host) && host.includes(':') ? `[${host}]` : host}:${relay.publicPort}/`;
   }
 
   /**
@@ -190,21 +191,26 @@ export class RelayClient extends EventEmitter {
 
   /**
    * Authenticate one connection to the relay.
-   * @returns {Promise<import('node:tls').TLSSocket>} A socket the relay holds idle.
+   * @returns {Promise<import('node:net').Socket>} A socket the relay holds idle.
    */
   #handshake() {
     const relay = this.#config.relay;
+    /* `protocol: http` speaks the same handshake over a plain socket. That puts the host
+       token on the wire in clear text, so it is opt-in and never inferred. */
+    const plain = relay.protocol === 'http';
 
     return new Promise((resolve, reject) => {
-      const pinned = relay.fingerprint !== undefined && relay.fingerprint !== '';
+      const pinned = !plain && relay.fingerprint !== undefined && relay.fingerprint !== '';
       const verify = pinned ? false : relay.insecure !== true;
 
-      const socket = tls.connect({
-        host: relay.host,
-        port: relay.port,
-        ...(isIpLiteral(relay.host) ? {} : { servername: relay.servername ?? relay.host }),
-        rejectUnauthorized: verify,
-      });
+      const socket = plain
+        ? net.connect({ host: relay.host, port: relay.port })
+        : tls.connect({
+          host: relay.host,
+          port: relay.port,
+          ...(isIpLiteral(relay.host) ? {} : { servername: relay.servername ?? relay.host }),
+          rejectUnauthorized: verify,
+        });
 
       let settled = false;
       let buffer = Buffer.alloc(0);
@@ -229,7 +235,7 @@ export class RelayClient extends EventEmitter {
       });
       socket.on('close', () => fail(new Error('relay closed the connection during the handshake')));
 
-      socket.once('secureConnect', () => {
+      socket.once(plain ? 'connect' : 'secureConnect', () => {
         if (pinned) {
           const peer = socket.getPeerCertificate();
           if (peer === null || peer === undefined || peer.raw === undefined) {

@@ -235,10 +235,11 @@ http://127.0.0.1:9300/                       # 之后直接开，可加入书签
 |---|---|---|
 | `host` | `''` | 中继地址；留空则用 `ssh.host` |
 | `port` | `8443` | 中继端口 |
+| `protocol` | `https` | `http` 用明文连接中继。访问密钥和 DSH 启动令牌会明文过网，只在可信链路里选 |
 | `publicHost` / `publicPort` | 空 / 同 `port` | 手机实际访问的地址，NAT 后面才需要 |
 | `token` | — | 中继校验 DSH 用的共享密钥 |
 | `accessToken` | — | 手机首次访问要出示的访问密钥（会写进配对链接） |
-| `hostId` | `default` | 一个中继端口服务一台 DSH |
+| `hostId` | `default` | 多机共用一个端口时，每台 DSH 用不同的 `hostId` + `token` + `accessToken` |
 | `fingerprint` | — | **强烈建议填**：固定自签证书的 SHA-256 指纹 |
 | `insecure` | `false` | 跳过证书校验，仅用于第一次试验 |
 | `poolSize` | `32` | 常驻的空闲连接数，手机连上不用等 |
@@ -250,6 +251,38 @@ http://127.0.0.1:9300/                       # 之后直接开，可加入书签
 > （脚本、样式、WebSocket），池子小了就会用光。中继现在的行为是：**没空闲连接就排队等最多 6 秒**
 > （`waitMs`），等补池，而不是立刻回 `503`——这正是之前白屏的成因。中继侧的 `--pool` 上限也要跟着放大
 > （默认 16，建议 64）。
+
+### 一个端口接多台 DSH
+
+中继按**访问密钥**选主机：浏览器在配对时用 `?rk=<accessToken>`，之后用 `dsh_relay` Cookie，
+两者都是路由键，所以不需要改路径、不需要重写 HTML。
+
+服务器端把主机表写成 JSON：
+
+```json
+[
+  { "hostId": "alpha", "hostToken": "…", "accessToken": "…" },
+  { "hostId": "beta",  "hostToken": "…", "accessToken": "…" }
+]
+```
+
+```bash
+node bin/dsh-relay.mjs --port 8443 --host <公网地址> --hosts-file ./hosts.json --pool 64
+```
+
+每台 DSH 的插件配置用**自己的**三项，`hostId` 必须和表里一致：
+
+```yaml
+relay:
+  host: <公网地址>
+  port: 8443
+  hostId: beta              # 与 hosts.json 对应
+  token: '<beta 的 hostToken>'
+  accessToken: '<beta 的 accessToken>'
+```
+
+`/__relay/health` 会列出每台的 `idle` / `open` / `served`，用它确认哪台掉线了。
+访问密钥重复会被中继在启动时直接拒绝。
 
 **ssh**
 
