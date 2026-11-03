@@ -41,6 +41,9 @@ const MAX_HANDSHAKE_BYTES = 4 * 1024;
 /** Browser cookie that carries a host's access token. */
 const ACCESS_COOKIE = 'dsh_relay';
 
+/** Browser cookie that remembers which machine was picked when a key is shared. */
+const HOST_COOKIE = 'dsh_host';
+
 /** Terminator of an HTTP request head. */
 const HEAD_TERMINATOR = Buffer.from('\r\n\r\n');
 
@@ -187,6 +190,48 @@ function normalizeHosts({ hosts, hostId = 'default', hostToken, accessToken }) {
 }
 
 /**
+ * Render the machine picker, shown when one access key covers several hosts.
+ * @param {object[]} hosts - Hosts sharing the key.
+ * @returns {string} HTML document.
+ */
+function renderPicker(hosts) {
+  const items = hosts.map((host) => {
+    const state = host.idle.length > 0
+      ? `${host.idle.length} ready`
+      : (host.registered ? 'reconnecting' : 'offline');
+    return `  <a class="host" href="/?h=${encodeURIComponent(host.hostId)}">
+    <span class="name">${escape(host.hostId)}</span>
+    <span class="state${host.idle.length > 0 ? '' : ' dim'}">${state}</span>
+  </a>`;
+  }).join('\n');
+
+  return `<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>DSH relay</title>
+<style>
+ body{font:16px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;margin:0;
+      min-height:100vh;display:grid;place-items:center;padding:1.5rem}
+ main{max-width:24rem;width:100%}
+ h1{font-size:1.15rem;margin:0 0 .35rem}
+ p{opacity:.7;font-size:.9rem;margin:0 0 1rem}
+ a.host{display:flex;justify-content:space-between;align-items:center;gap:.75rem;
+        padding:.85rem 1rem;margin-bottom:.6rem;border-radius:.7rem;text-decoration:none;
+        color:inherit;border:1px solid rgba(128,128,128,.35)}
+ a.host:active{border-color:#2563eb}
+ .name{font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+ .state{font-size:.78rem;opacity:.65;white-space:nowrap}
+ .state.dim{opacity:.4}
+</style></head><body>
+<main>
+  <h1>Choose a machine</h1>
+  <p>This access key covers ${hosts.length} DSH machines. Your choice is remembered.</p>
+${items}
+</main>
+</body></html>`;
+}
+
+/**
  * Start the relay.
  *
  * @param {object} options - Relay options.
@@ -232,12 +277,14 @@ export async function createRelay({
     }
   }
 
-  const seenTokens = new Set();
+  /* Several hosts may share one accessToken on purpose: that is the "one link, pick a machine"
+     mode. A shared key turns those hosts into a group the browser chooses from. */
+  const seenHostIds = new Set();
   for (const host of configured) {
-    if (seenTokens.has(host.accessToken)) {
-      throw new Error(`relay: two hosts share the same accessToken (${host.hostId})`);
+    if (seenHostIds.has(host.hostId)) {
+      throw new Error(`relay: two hosts share the same hostId (${host.hostId})`);
     }
-    seenTokens.add(host.accessToken);
+    seenHostIds.add(host.hostId);
   }
 
   const material = secure
@@ -262,13 +309,14 @@ export async function createRelay({
   const stats = { rejectedHosts: 0, rejectedBrowsers: 0 };
 
   /**
-   * Find a host by an access key a browser presented.
+   * Find every host that accepts an access key. More than one means the key is shared and the
+   * browser must pick a machine.
    * @param {string | null | undefined} key - Candidate access token.
-   * @returns {object | undefined} The matching host, when one exists.
+   * @returns {object[]} Matching hosts, empty when the key is unknown.
    */
-  const hostByAccessKey = (key) => (key === null || key === undefined
-    ? undefined
-    : table.find((host) => tokenEquals(key, host.accessToken)));
+  const hostsByAccessKey = (key) => (key === null || key === undefined
+    ? []
+    : table.filter((host) => tokenEquals(key, host.accessToken)));
 
   /**
    * Find a host by the credentials a host connection presented.
@@ -447,15 +495,16 @@ automatically — reload in a few seconds.</p></body>`);
       return;
     }
 
-    /* The credential selects the host: `?rk=` while pairing, the cookie afterwards. A cookie
-       always wins, so a stale key from another host cannot redirect an authenticated session. */
+    /* The credential selects a *group*: `?rk=` while pairing, the cookie afterwards. A cookie
+       always wins, so a stale key cannot redirect an authenticated session. When several hosts
+       share one key, `dsh_host` picks one and the root offers a picker instead. */
     const presented = url.searchParams.get('rk');
     const cookieKey = readCookie(headers.cookie, ACCESS_COOKIE);
-    const cookieHost = hostByAccessKey(cookieKey);
-    const presentedHost = hostByAccessKey(presented);
-    const host = cookieHost ?? presentedHost;
+    const cookieGroup = hostsByAccessKey(cookieKey);
+    const presentedGroup = hostsByAccessKey(presented);
+    const group = cookieGroup.length > 0 ? cookieGroup : presentedGroup;
 
-    if (host === undefined) {
+    if (group.length === 0) {
       if (presented !== null) {
         stats.rejectedBrowsers += 1;
         respond(socket, 403, renderLogin('That access key was not accepted.'));
@@ -465,8 +514,8 @@ automatically — reload in a few seconds.</p></body>`);
       return;
     }
 
-    if (cookieHost === undefined) {
-      if (presentedHost === undefined) {
+    if (cookieGroup.length === 0) {
+      if (presentedGroup.length === 0) {
         respond(socket, 200, renderLogin());
         return;
       }
@@ -477,11 +526,37 @@ automatically — reload in a few seconds.</p></body>`);
         const attributes = `Path=/; HttpOnly; SameSite=Lax; Max-Age=31536000${secure ? '; Secure' : ''}`;
         respond(socket, 303, '', {
           location: `${url.pathname === '' ? '/' : url.pathname}${url.search}`,
-          'set-cookie': `${ACCESS_COOKIE}=${host.accessToken}; ${attributes}`,
+          'set-cookie': `${ACCESS_COOKIE}=${group[0].accessToken}; ${attributes}`,
         });
         return;
       }
     }
+
+    const requestedId = url.searchParams.get('h');
+    const requested = requestedId === null
+      ? undefined
+      : group.find((host) => host.hostId === requestedId);
+    if (requested !== undefined) {
+      url.searchParams.delete('h');
+      const attributes = `Path=/; HttpOnly; SameSite=Lax; Max-Age=31536000${secure ? '; Secure' : ''}`;
+      respond(socket, 303, '', {
+        location: `${url.pathname === '' ? '/' : url.pathname}${url.search}`,
+        'set-cookie': `${HOST_COOKIE}=${requested.hostId}; ${attributes}`,
+      });
+      return;
+    }
+
+    const chosenId = readCookie(headers.cookie, HOST_COOKIE);
+    const chosen = chosenId === undefined ? undefined : group.find((host) => host.hostId === chosenId);
+
+    /* A shared key with no machine chosen yet gets the picker; a per-machine key goes straight
+       through, so existing single-host links keep working unchanged. */
+    if (group.length > 1 && chosen === undefined) {
+      respond(socket, 200, renderPicker(group));
+      return;
+    }
+
+    const host = chosen ?? group[0];
 
     const prefix = Buffer.concat([head, HEAD_TERMINATOR, leftover]);
     const entry = takeIdle(host);

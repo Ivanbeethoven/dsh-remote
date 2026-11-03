@@ -134,6 +134,62 @@ test('one port serves two hosts, selected by access key', async (t) => {
   assert.equal(unknown.status, 403);
 });
 
+test('a shared access key offers a picker, then remembers the choice', async (t) => {
+  const alpha = await startNamedTarget('alpha');
+  const beta = await startNamedTarget('beta');
+  const { certFile, keyFile } = certificateFiles();
+  const shared = 'shared-access-key-abc';
+
+  const relay = await createRelay({
+    port: 0,
+    bind: '127.0.0.1',
+    hosts: [
+      { ...HOST_A, accessToken: shared },
+      { ...HOST_B, accessToken: shared },
+    ],
+    certFile,
+    keyFile,
+    certHosts: ['127.0.0.1'],
+    poolSize: 4,
+    waitMs: 600,
+  });
+
+  const clientA = makeClient({ host: { ...HOST_A, accessToken: shared }, port: relay.port, targetPort: alpha.port });
+  const clientB = makeClient({ host: { ...HOST_B, accessToken: shared }, port: relay.port, targetPort: beta.port });
+
+  t.after(async () => {
+    clientA.stop();
+    clientB.stop();
+    await relay.close();
+    await alpha.close();
+    await beta.close();
+  });
+
+  await waitFor(() => clientA.status().idle > 0 && clientB.status().idle > 0, { timeoutMs: 10_000 });
+
+  const paired = await pair({ port: relay.port, accessToken: shared });
+  assert.equal(paired.status, 303);
+
+  /* One key, no machine chosen: the browser gets a choice instead of an arbitrary host. */
+  const picker = await request({ port: relay.port, cookie: paired.cookie, path: '/' });
+  assert.equal(picker.status, 200);
+  assert.match(picker.body, /Choose a machine/);
+  assert.match(picker.body, /alpha/);
+  assert.match(picker.body, /beta/);
+
+  const choose = await request({ port: relay.port, cookie: paired.cookie, path: '/?h=beta' });
+  assert.equal(choose.status, 303);
+  assert.match(choose.headers['set-cookie'], /dsh_host=beta/);
+
+  const both = `${paired.cookie}; dsh_host=beta`;
+  const page = await request({ port: relay.port, cookie: both, path: '/' });
+  assert.equal(page.status, 200);
+  assert.equal(page.body, 'beta:/', 'the choice routes the session to that machine');
+
+  const other = await request({ port: relay.port, cookie: `${paired.cookie}; dsh_host=alpha`, path: '/x' });
+  assert.equal(other.body, 'alpha:/x');
+});
+
 test('a plain relay serves the same flow, with a non-Secure cookie', async (t) => {
   const target = await startNamedTarget('plain');
   const relay = await createRelay({
