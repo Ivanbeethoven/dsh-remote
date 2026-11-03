@@ -20,7 +20,10 @@ import path from 'node:path';
  */
 export function resolveWithin(root, requested) {
   const base = path.resolve(root);
-  const cleaned = (requested ?? '').replace(/^\/+/, '');
+  const raw = requested ?? '';
+  /* An absolute path is accepted only when it already sits inside the root: the client knows
+     the host path of a file and should not have to translate it into a relative one. */
+  const cleaned = path.isAbsolute(raw) ? raw : raw.replace(/^\/+/, '');
   const target = path.resolve(base, cleaned);
   if (target !== base && !target.startsWith(`${base}${path.sep}`)) return undefined;
   return target;
