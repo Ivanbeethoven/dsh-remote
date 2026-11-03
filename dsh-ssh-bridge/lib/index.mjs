@@ -25,6 +25,7 @@ import Schema from '@deepseek-ai/schemastery';
 import { buildPairing, buildRelayPairing, describePairing } from './pairing.mjs';
 import { renderStatusPage } from './page.mjs';
 import { startLocalPage } from './local-page.mjs';
+import { pushFile } from './push.mjs';
 import { RelayClient } from './relay-client.mjs';
 import { tokenEquals } from './relay-protocol.mjs';
 import { SshTunnel } from './tunnel.mjs';
@@ -129,6 +130,19 @@ export const Config = Schema.object({
   }).description('Phone pairing instructions.'),
   statusPage: Schema.boolean().default(true)
     .description('Register /ssh-bridge and /ssh-bridge/status on the DSH web listener.'),
+  push: Schema.object({
+    targets: Schema.dict(Schema.object({
+      host: Schema.string().required().description('Machine that receives the file.'),
+      port: Schema.natural().min(1).max(65535).default(22),
+      username: Schema.string().default('root'),
+      dir: Schema.string().default('.').description('Remote directory a push lands in by default.'),
+      privateKeyPath: Schema.string().default('').description('Key file; empty falls back to `password`.'),
+      privateKeyPassphrase: Schema.string().default('').role('secret'),
+      password: Schema.string().default('').role('secret'),
+      hostKeyFingerprint: Schema.string().default('')
+        .description('Optional `SHA256:…` pin. When set, an unlisted host key is refused.'),
+    })).default({}).description('Named destinations for /ssh-bridge/push.'),
+  }).description('Send a file from this machine to another machine over SSH.'),
 });
 
 /**
@@ -205,6 +219,21 @@ export function resolveConfig(config = {}) {
       localHost: pairing.localHost || '127.0.0.1',
     },
     statusPage: config.statusPage ?? true,
+    push: {
+      targets: Object.fromEntries(Object.entries(config.push?.targets ?? {}).map(([name, target]) => [
+        name,
+        {
+          host: target.host,
+          port: target.port ?? 22,
+          username: target.username || 'root',
+          dir: target.dir ?? '.',
+          privateKeyPath: target.privateKeyPath ?? '',
+          privateKeyPassphrase: target.privateKeyPassphrase || undefined,
+          password: target.password || undefined,
+          hostKeyFingerprint: (target.hostKeyFingerprint ?? '').trim(),
+        },
+      ])),
+    },
   };
 }
 
@@ -294,6 +323,79 @@ function isAuthorized(ctx, request, accessKey) {
 function isSameSite(request) {
   const site = request.headers['sec-fetch-site'];
   return site === undefined || site === 'same-origin' || site === 'none';
+}
+
+/**
+ * Escape text for HTML.
+ * @param {unknown} value - Text to escape.
+ * @returns {string} Escaped text.
+ */
+function escapeHtml(value) {
+  return String(value ?? '')
+    .replaceAll('&', '&amp;')
+    .replaceAll('<', '&lt;')
+    .replaceAll('>', '&gt;')
+    .replaceAll('"', '&quot;');
+}
+
+/**
+ * Render the push page: pick a target, name a local file, send it.
+ * @param {string} selector - Rendered target selector, or an empty-state message.
+ * @param {boolean} empty - Whether no targets are configured.
+ * @returns {string} HTML document.
+ */
+function pushPage(selector, empty) {
+  return `<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Send a file</title>
+<style>
+ body{font:16px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;margin:0;padding:1.5rem}
+ main{max-width:26rem;margin:0 auto}
+ h1{font-size:1.15rem;margin:0 0 .35rem}
+ p{opacity:.7;font-size:.9rem;margin:0 0 1rem}
+ label{display:block;font-size:.82rem;opacity:.7;margin:.9rem 0 .3rem}
+ input,select{width:100%;box-sizing:border-box;padding:.7rem .8rem;font:inherit;border-radius:.6rem;
+   border:1px solid rgba(128,128,128,.45);background:transparent;color:inherit}
+ button{margin-top:1rem;width:100%;padding:.75rem;font:inherit;font-weight:600;border-radius:.6rem;
+   border:0;background:#2563eb;color:#fff}
+ pre{margin-top:1rem;padding:.8rem;border-radius:.6rem;background:rgba(128,128,128,.12);
+   font-size:.82rem;white-space:pre-wrap;word-break:break-all;min-height:1rem}
+</style></head><body>
+<main>
+  <h1>Send a file</h1>
+  <p>Copies a file from this machine to another machine over SSH.</p>
+  <label for="target">Destination</label>
+  ${selector}
+  <label for="path">Local path</label>
+  <input id="path" name="path" placeholder="/path/on/this/machine" ${empty ? 'disabled' : ''}>
+  <label for="dir">Remote directory (optional)</label>
+  <input id="dir" name="dir" placeholder="uses the target's default" ${empty ? 'disabled' : ''}>
+  <button id="go" ${empty ? 'disabled' : ''}>Send</button>
+  <pre id="out"></pre>
+</main>
+<script>
+document.getElementById('go').addEventListener('click', async () => {
+  const out = document.getElementById('out');
+  const target = document.querySelector('[name=target]');
+  const path = document.getElementById('path').value.trim();
+  const dir = document.getElementById('dir').value.trim();
+  if (!target || path === '') { out.textContent = 'Pick a target and a path.'; return; }
+  out.textContent = 'sending…';
+  const query = new URLSearchParams({ target: target.value, path });
+  if (dir !== '') query.set('dir', dir);
+  try {
+    const response = await fetch('/ssh-bridge/push?' + query, { method: 'POST' });
+    const body = await response.json();
+    out.textContent = body.ok
+      ? 'sent ' + body.bytes + ' bytes to ' + body.remotePath
+      : 'failed: ' + body.error;
+  } catch (error) {
+    out.textContent = 'failed: ' + error.message;
+  }
+});
+</script>
+</body></html>`;
 }
 
 /**
@@ -566,6 +668,72 @@ export async function apply(ctx, config) {
         setTimeout(() => transport.restart(), 150).unref?.();
       },
     }), 'ssh-bridge: reconnect route');
+
+    /* Pushing a file to another machine: the relay only reaches this DSH, so the transfer is
+       made here, with the same credentials the SSH transport already knows how to use. */
+    webCtx.effect(() => webServer.register({
+      kind: 'exact',
+      path: '/ssh-bridge/push',
+      handler: async (request, response) => {
+        if (!isAuthorized(webCtx, request, resolved.relay.accessToken)) {
+          response.writeHead(403, { 'content-type': 'text/plain; charset=utf-8' });
+          response.end('forbidden');
+          return;
+        }
+
+        const url = new URL(request.url ?? '/', 'http://dsh.invalid');
+        const targets = resolved.push.targets;
+        const names = Object.keys(targets);
+
+        if ((request.method ?? 'GET') === 'GET') {
+          const options = names.length === 0
+            ? '<p class="empty">No targets configured. Add <code>push.targets</code> to the plugin config.</p>'
+            : `<select name="target">${names.map((name) => `<option value="${escapeHtml(name)}">${escapeHtml(name)}</option>`).join('')}</select>`;
+          response.writeHead(200, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' });
+          response.end(pushPage(options, names.length === 0));
+          return;
+        }
+
+        if (request.method !== 'POST') {
+          response.writeHead(405, { allow: 'GET, POST' });
+          response.end();
+          return;
+        }
+        if (!isSameSite(request)) {
+          response.writeHead(403, { 'content-type': 'text/plain; charset=utf-8' });
+          response.end('forbidden');
+          return;
+        }
+
+        const name = url.searchParams.get('target') ?? '';
+        const localPath = url.searchParams.get('path') ?? '';
+        const remoteDir = url.searchParams.get('dir') ?? undefined;
+        const target = targets[name];
+
+        const json = (status, body) => {
+          response.writeHead(status, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' });
+          response.end(`${JSON.stringify(body)}\n`);
+        };
+
+        if (target === undefined) {
+          json(404, { ok: false, error: `unknown target: ${name}` });
+          return;
+        }
+
+        try {
+          const result = await pushFile({
+            target,
+            localPath,
+            remotePath: remoteDir === undefined || remoteDir === ''
+              ? undefined
+              : `${remoteDir.replace(/\/+$/, '')}/${localPath.split(/[\\/]/).pop()}`,
+          });
+          json(200, { ok: true, ...result });
+        } catch (error) {
+          json(400, { ok: false, error: error.message });
+        }
+      },
+    }), 'ssh-bridge: push route');
   });
 }
 
