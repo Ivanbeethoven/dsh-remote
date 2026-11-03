@@ -20,10 +20,12 @@
 
 import os from 'node:os';
 import path from 'node:path';
+import * as fileSystem from 'node:fs';
 import Schema from '@deepseek-ai/schemastery';
 
 import { buildPairing, buildRelayPairing, describePairing } from './pairing.mjs';
 import { renderStatusPage } from './page.mjs';
+import { listDirectory, renderFilesPage, resolveWithin } from './files-page.mjs';
 import { startLocalPage } from './local-page.mjs';
 import { RelayClient } from './relay-client.mjs';
 import { tokenEquals } from './relay-protocol.mjs';
@@ -129,6 +131,10 @@ export const Config = Schema.object({
   }).description('Phone pairing instructions.'),
   statusPage: Schema.boolean().default(true)
     .description('Register /ssh-bridge and /ssh-bridge/status on the DSH web listener.'),
+  files: Schema.object({
+    root: Schema.string().default('')
+      .description('Directory /ssh-bridge/files browses. Empty falls back to the host process directory, which is rarely what you want.'),
+  }).description('File browser for other devices.'),
 });
 
 /**
@@ -205,6 +211,9 @@ export function resolveConfig(config = {}) {
       localHost: pairing.localHost || '127.0.0.1',
     },
     statusPage: config.statusPage ?? true,
+    files: {
+      root: (config.files?.root ?? '').trim(),
+    },
   };
 }
 
@@ -566,6 +575,97 @@ export async function apply(ctx, config) {
         setTimeout(() => transport.restart(), 150).unref?.();
       },
     }), 'ssh-bridge: reconnect route');
+
+    /* A file browser for other devices. The chat's file cards are rendered by the desktop
+       client and only offer "open with <a local program>", which is meaningless from a phone,
+       so this serves the workspace over HTTP with a real attachment download. */
+    const filesRoot = resolved.files.root === '' ? process.cwd() : resolved.files.root;
+    const filesKey = (request) => {
+      try {
+        return new URL(request.url ?? '/', 'http://dsh.invalid').searchParams.get('rk') ?? '';
+      } catch {
+        return '';
+      }
+    };
+
+    webCtx.effect(() => webServer.register({
+      kind: 'prefix',
+      path: '/ssh-bridge/files',
+      handler: (request, response) => {
+        if (!isAuthorized(webCtx, request, resolved.relay.accessToken)) {
+          response.writeHead(403, { 'content-type': 'text/plain; charset=utf-8' });
+          response.end('forbidden');
+          return;
+        }
+        let relative = '';
+        try {
+          relative = (new URL(request.url ?? '/', 'http://dsh.invalid').searchParams.get('d') ?? '')
+            .replace(/^\/+|\/+$/g, '');
+        } catch {
+          relative = '';
+        }
+        const target = resolveWithin(filesRoot, relative);
+        if (target === undefined) {
+          response.writeHead(400, { 'content-type': 'text/plain; charset=utf-8' });
+          response.end('outside the workspace');
+          return;
+        }
+        let entries;
+        try {
+          entries = listDirectory(target);
+        } catch {
+          response.writeHead(404, { 'content-type': 'text/plain; charset=utf-8' });
+          response.end('not found');
+          return;
+        }
+        response.writeHead(200, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' });
+        response.end(renderFilesPage({ relative, entries, key: filesKey(request) }));
+      },
+    }), 'ssh-bridge: files page');
+
+    webCtx.effect(() => webServer.register({
+      kind: 'exact',
+      path: '/ssh-bridge/file',
+      handler: (request, response) => {
+        if (!isAuthorized(webCtx, request, resolved.relay.accessToken)) {
+          response.writeHead(403, { 'content-type': 'text/plain; charset=utf-8' });
+          response.end('forbidden');
+          return;
+        }
+        let requested = '';
+        try {
+          requested = new URL(request.url ?? '/', 'http://dsh.invalid').searchParams.get('p') ?? '';
+        } catch {
+          requested = '';
+        }
+        const target = resolveWithin(filesRoot, requested);
+        if (target === undefined) {
+          response.writeHead(400, { 'content-type': 'text/plain; charset=utf-8' });
+          response.end('outside the workspace');
+          return;
+        }
+        let stat;
+        try {
+          stat = fileSystem.statSync(target);
+        } catch {
+          response.writeHead(404, { 'content-type': 'text/plain; charset=utf-8' });
+          response.end('not found');
+          return;
+        }
+        if (!stat.isFile()) {
+          response.writeHead(404, { 'content-type': 'text/plain; charset=utf-8' });
+          response.end('not a file');
+          return;
+        }
+        response.writeHead(200, {
+          'content-type': 'application/octet-stream',
+          'content-length': stat.size,
+          'content-disposition': `attachment; filename*=UTF-8''${encodeURIComponent(path.basename(target))}`,
+          'cache-control': 'no-store',
+        });
+        fileSystem.createReadStream(target).pipe(response);
+      },
+    }), 'ssh-bridge: file download');
   });
 }
 
